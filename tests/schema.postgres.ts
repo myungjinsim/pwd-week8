@@ -1,0 +1,423 @@
+import { PGlite } from "@electric-sql/pglite";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import assert from "node:assert/strict";
+import { test, before, beforeEach, after } from "node:test";
+
+const schema = readFileSync(
+  path.join(__dirname, "../supabase/schema.sql"),
+  "utf8",
+);
+const seed = readFileSync(path.join(__dirname, "../supabase/seed.sql"), "utf8");
+const adminId = "11111111-1111-4111-8111-111111111111";
+const userId = "22222222-2222-4222-8222-222222222222";
+const authBootstrap = `create role anon; create role authenticated; create role service_role bypassrls;
+  create schema auth; create table auth.users(id uuid primary key,email text,raw_user_meta_data jsonb,raw_app_meta_data jsonb);
+  create function auth.uid() returns uuid language sql stable as $$
+    select nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub', '')::uuid $$;
+  grant usage on schema auth to anon, authenticated, service_role;`;
+let db: PGlite;
+before(async () => {
+  db = new PGlite();
+  await db.exec(authBootstrap);
+  await db.exec(schema);
+});
+beforeEach(async () => {
+  await db.exec(
+    "reset role; select set_config('request.jwt.claims', '', false); drop function if exists public.fail_approval() cascade; truncate auth.users,public.profiles,public.submissions,public.restaurants restart identity cascade;",
+  );
+  await db.exec(seed);
+  await db.query(
+    `insert into auth.users values ($1,'admin@example.test','{"name":"관리자","user_type":"admin"}','{"provider":"email"}'),($2,'user@example.test','{"name":"일반 사용자"}','{"provider":"email"}')`,
+    [adminId, userId],
+  );
+  await db.query("update public.profiles set user_type=$1 where id=$2", [
+    "admin",
+    adminId,
+  ]);
+});
+after(async () => {
+  await db?.close();
+});
+
+test("7주차 데이터 점검·수정 후 재시도하면 맛집을 보존하고 옛 초기화 RPC를 제거한다", async () => {
+  const previous = new PGlite();
+  const week7Schema = readFileSync(
+    path.join(__dirname, "fixtures/week7-schema.sql"),
+    "utf8",
+  );
+  const preflight = readFileSync(
+    path.join(__dirname, "../supabase/preflight-week7.sql"),
+    "utf8",
+  );
+  try {
+    await previous.exec(authBootstrap);
+    await previous.exec(week7Schema);
+    await previous.exec(`set role service_role;
+      select public.reset_restaurant_demo_data();
+      insert into public.restaurants(name,category,location,rating) values ('7주차 추가 맛집','한식','캠퍼스',7);
+      reset role;`);
+    const invalidRows = [{ id: 4, field: "rating", current_value: "7" }];
+    assert.deepEqual((await previous.query(preflight)).rows, invalidRows);
+    await assert.rejects(previous.exec(schema), {
+      code: "23514",
+      hint: /preflight-week7\.sql/,
+    });
+    await previous.exec("rollback");
+    const profiles = await previous.query("select to_regclass('public.profiles') as relation");
+    assert.deepEqual(profiles.rows, [{ relation: null }]);
+    assert.deepEqual((await previous.query(preflight)).rows, invalidRows);
+
+    await previous.exec("update public.restaurants set rating=4.7 where id=4");
+    assert.deepEqual((await previous.query(preflight)).rows, []);
+    const list = `select id,name,category,location,price_range,rating,
+      description,recommended_menu,likes,image from public.restaurants order by id`;
+    const beforeMigration = (await previous.query(list)).rows;
+    assert.equal(beforeMigration.length, 4);
+    await previous.exec(schema);
+    await previous.exec(seed);
+    await previous.exec("set role service_role");
+    await assert.rejects(
+      previous.query("select public.reset_restaurant_demo_data()"),
+      { code: "42883" },
+    );
+    assert.deepEqual((await previous.query(list)).rows, beforeMigration);
+  } finally {
+    await previous.close();
+  }
+});
+
+test("이메일·이름이 없는 네이버 OIDC 사용자도 UUID 프로필을 만들고 이름을 보완할 수 있다", async () => {
+  const id = "44444444-4444-4444-8444-444444444444";
+  await db.query(
+    `insert into auth.users values ($1,null,'{}','{"provider":"custom:naver"}')`,
+    [id],
+  );
+  const { rows } = await db.query<{
+    id: string;
+    email: string;
+    name: string;
+    provider: string;
+    user_type: string;
+  }>("select * from public.profiles where id=$1", [id]);
+  assert.equal(rows[0].id, id);
+  assert.equal(rows[0].email, "");
+  assert.equal(rows[0].name, "사용자");
+  assert.equal(rows[0].provider, "custom:naver");
+  assert.equal(rows[0].user_type, "user");
+  await db.query(
+    "update public.profiles set name='네이버 실습 사용자' where id=$1",
+    [id],
+  );
+  assert.equal(
+    (
+      await db.query<{ name: string }>(
+        "select name from public.profiles where id=$1",
+        [id],
+      )
+    ).rows[0].name,
+    "네이버 실습 사용자",
+  );
+});
+async function createSubmission() {
+  const { rows } = await db.query<{ id: number }>(
+    `insert into public.submissions(restaurant_name,category,location,submitter_id,submitter_name,submitter_email)
+    values ('제보 식당','한식','캠퍼스',$1,'사용자','user@example.test') returning id`,
+    [userId],
+  );
+  return rows[0].id;
+}
+test("Auth 트리거가 프로필을 생성하며 metadata로 관리자 권한을 얻을 수 없다", async () => {
+  const id = "33333333-3333-4333-8333-333333333333";
+  await db.query(
+    `insert into auth.users values ($1,'injected@example.test','{"name":"관리자","user_type":"admin","userType":"admin"}','{"provider":"email"}')`,
+    [id],
+  );
+  const { rows } = await db.query<{ user_type: string; name: string }>(
+    "select * from public.profiles where id=$1",
+    [id],
+  );
+  assert.equal(rows[0].user_type, "user");
+  assert.equal(rows[0].name, "관리자");
+});
+test("스키마·seed 재실행이 기존 맛집과 관리자 역할을 보존한다", async () => {
+  await db.query(
+    "update public.restaurants set description='보존할 값' where id=1",
+  );
+  await db.exec(schema);
+  await db.exec(seed);
+  assert.equal(
+    (
+      await db.query<{ description: string }>(
+        "select description from public.restaurants where id=1",
+      )
+    ).rows[0].description,
+    "보존할 값",
+  );
+  assert.equal(
+    (
+      await db.query<{ user_type: string }>(
+        "select user_type from public.profiles where id=$1",
+        [adminId],
+      )
+    ).rows[0].user_type,
+    "admin",
+  );
+});
+test("서버 역할은 맛집을 수정할 수 있고 브라우저 역할은 계정·제보 테이블과 RPC에 접근할 수 없다", async () => {
+  for (const role of ["anon", "authenticated"]) {
+    await db.exec(`set role ${role}`);
+    // 맛집 조회는 RLS 정책으로 공개, 계정·제보는 계속 서버 전용입니다.
+    assert.equal(
+      (await db.query("select * from public.restaurants")).rows.length,
+      3,
+    );
+    for (const table of ["profiles", "submissions"])
+      await assert.rejects(db.query(`select * from public.${table}`), {
+        code: "42501",
+      });
+    await assert.rejects(
+      db.query("select public.set_foodmap_user_type($1,$2)", [userId, "admin"]),
+      { code: "42501" },
+    );
+    await assert.rejects(
+      db.query("select public.approve_foodmap_submission(1,$1)", [adminId]),
+      { code: "42501" },
+    );
+    await db.exec("reset role");
+  }
+  await db.exec("set role service_role");
+  await db.query("update public.restaurants set name='수정 성공' where id=1");
+});
+test("승인하면 맛집·제보 상태가 함께 바뀌고 재호출은 같은 맛집을 반환한다", async () => {
+  const id = await createSubmission();
+  const first = await db.query<{ id: number }>(
+    "select * from public.approve_foodmap_submission($1,$2)",
+    [id, adminId],
+  );
+  const second = await db.query<{ id: number }>(
+    "select * from public.approve_foodmap_submission($1,$2)",
+    [id, adminId],
+  );
+  assert.equal(first.rows[0].id, second.rows[0].id);
+  assert.equal(
+    (await db.query("select * from public.restaurants")).rows.length,
+    4,
+  );
+  assert.equal(
+    (
+      await db.query<{ status: string }>(
+        "select status from public.submissions where id=$1",
+        [id],
+      )
+    ).rows[0].status,
+    "approved",
+  );
+});
+test("일반 사용자를 검토자로 전달하거나 거절된 제보를 승인할 수 없다", async () => {
+  const id = await createSubmission();
+  await assert.rejects(
+    db.query("select * from public.approve_foodmap_submission($1,$2)", [
+      id,
+      userId,
+    ]),
+    /REVIEWER_NOT_ADMIN/,
+  );
+  await db.query(
+    "update public.submissions set status='rejected' where id=$1",
+    [id],
+  );
+  await assert.rejects(
+    db.query("select * from public.approve_foodmap_submission($1,$2)", [
+      id,
+      adminId,
+    ]),
+    /SUBMISSION_NOT_PENDING/,
+  );
+});
+test("승인 상태 저장이 실패하면 생성한 맛집도 롤백된다", async () => {
+  const id = await createSubmission();
+  await db.exec(`create function public.fail_approval() returns trigger language plpgsql as $$ begin raise exception 'forced failure'; end $$;
+    create trigger fail_approval before update on public.submissions for each row execute function public.fail_approval();`);
+  await assert.rejects(
+    db.query("select * from public.approve_foodmap_submission($1,$2)", [
+      id,
+      adminId,
+    ]),
+    /forced failure/,
+  );
+  assert.equal(
+    (await db.query("select * from public.restaurants")).rows.length,
+    3,
+  );
+  assert.equal(
+    (
+      await db.query<{ status: string }>(
+        "select status from public.submissions",
+      )
+    ).rows[0].status,
+    "pending",
+  );
+});
+test("마지막 관리자의 권한 해제·비활성화를 차단하고 다른 관리자가 있으면 변경한다", async () => {
+  await assert.rejects(
+    db.query("select public.set_foodmap_user_type($1,$2)", [adminId, "user"]),
+    /LAST_ADMIN/,
+  );
+  await assert.rejects(
+    db.query("select public.deactivate_foodmap_account($1)", [adminId]),
+    /LAST_ADMIN/,
+  );
+  await db.query("select public.set_foodmap_user_type($1,$2)", [
+    userId,
+    "admin",
+  ]);
+  await db.query("select public.set_foodmap_user_type($1,$2)", [
+    adminId,
+    "user",
+  ]);
+  await db.query("select public.deactivate_foodmap_account($1)", [adminId]);
+  await assert.rejects(
+    db.query("select public.set_foodmap_user_type($1,$2)", [adminId, "admin"]),
+    /INACTIVE_USER/,
+  );
+});
+test("DB가 ID를 생성하고 잘못된 평점·빈 이름·상태를 거절한다", async () => {
+  const { rows } = await db.query<{ id: number }>(
+    "insert into public.restaurants(name,category,location) values ('추가 식당','한식','캠퍼스') returning id",
+  );
+  assert.equal(rows[0].id, 4);
+  await assert.rejects(
+    db.query("update public.restaurants set rating=6 where id=1"),
+    { code: "23514" },
+  );
+  await assert.rejects(
+    db.query("update public.restaurants set name=' ' where id=1"),
+    { code: "23514" },
+  );
+  const id = await createSubmission();
+  await assert.rejects(
+    db.query("update public.submissions set status='other' where id=$1", [id]),
+    { code: "23514" },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// [과제] RLS: 회원은 본인 맛집만, 관리자는 모든 맛집을 수정·삭제한다.
+// Supabase는 요청 토큰의 sub를 request.jwt.claims로 전달하고 authenticated 역할로 실행합니다.
+// ---------------------------------------------------------------------------
+const otherId = "44444444-4444-4444-8444-444444444444";
+async function actAs(sub: string | null) {
+  await db.exec("reset role");
+  if (sub === null) {
+    await db.query("select set_config('request.jwt.claims', '', false)");
+    await db.exec("set role anon");
+    return;
+  }
+  await db.query("select set_config('request.jwt.claims', $1, false)", [
+    JSON.stringify({ sub, role: "authenticated" }),
+  ]);
+  await db.exec("set role authenticated");
+}
+async function addOtherMember() {
+  await db.query(
+    `insert into auth.users values ($1,'other@example.test','{"name":"다른 회원"}','{"provider":"google"}')`,
+    [otherId],
+  );
+}
+async function insertAs(sub: string, name = "회원 맛집") {
+  await actAs(sub);
+  const { rows } = await db.query<{ id: number; created_by: string }>(
+    "insert into public.restaurants(name,category,location) values ($1,'한식','캠퍼스') returning id, created_by",
+    [name],
+  );
+  return rows[0];
+}
+test("RLS: 비회원은 조회만 하고 등록·수정·삭제는 거절된다", async () => {
+  await actAs(null);
+  assert.equal((await db.query("select * from public.restaurants")).rows.length, 3);
+  await assert.rejects(
+    db.query("insert into public.restaurants(name,category,location) values ('비회원','한식','캠퍼스')"),
+    { code: "42501" },
+  );
+  await assert.rejects(db.query("update public.restaurants set name='x' where id=1"), { code: "42501" });
+  await assert.rejects(db.query("delete from public.restaurants where id=1"), { code: "42501" });
+  await db.exec("reset role");
+});
+test("RLS: 회원 등록은 등록자가 본인으로 기록되고 다른 사람 명의 등록은 거절된다", async () => {
+  const row = await insertAs(userId);
+  assert.equal(row.created_by, userId);
+  await assert.rejects(
+    db.query(
+      "insert into public.restaurants(name,category,location,created_by) values ('사칭','한식','캠퍼스',$1)",
+      [adminId],
+    ),
+    { code: "42501" },
+  );
+  await db.exec("reset role");
+});
+test("RLS: 다른 회원의 수정·삭제는 0행으로 차단되고 본인은 허용된다", async () => {
+  await addOtherMember();
+  const { id } = await insertAs(userId, "A의 맛집");
+  await actAs(otherId);
+  assert.equal((await db.query("update public.restaurants set name='B가 수정' where id=$1", [id])).affectedRows, 0);
+  assert.equal((await db.query("delete from public.restaurants where id=$1", [id])).affectedRows, 0);
+  // 시딩된 기본 맛집(등록자 없음)도 일반 회원은 수정할 수 없다
+  assert.equal((await db.query("update public.restaurants set name='x' where id=1")).affectedRows, 0);
+  await actAs(userId);
+  assert.equal((await db.query("update public.restaurants set name='A가 수정' where id=$1", [id])).affectedRows, 1);
+  await db.exec("reset role");
+  const { rows } = await db.query<{ name: string }>("select name from public.restaurants where id=$1", [id]);
+  assert.equal(rows[0].name, "A가 수정");
+});
+test("RLS: 관리자는 다른 회원의 맛집을 수정·삭제할 수 있다", async () => {
+  const { id } = await insertAs(userId, "A의 맛집");
+  await actAs(adminId);
+  assert.equal((await db.query("update public.restaurants set name='관리자 수정' where id=$1", [id])).affectedRows, 1);
+  assert.equal((await db.query("update public.restaurants set name='기본 맛집 수정' where id=1")).affectedRows, 1);
+  assert.equal((await db.query("delete from public.restaurants where id=$1", [id])).affectedRows, 1);
+  await db.exec("reset role");
+});
+test("RLS: 회원은 등록자 열을 바꿔 소유권을 가져갈 수 없고 비활성 계정은 쓰기가 막힌다", async () => {
+  const { id } = await insertAs(userId);
+  await assert.rejects(
+    db.query("update public.restaurants set created_by=$1 where id=$2", [userId, 1]),
+    { code: "42501" },
+  );
+  await db.exec("reset role");
+  await db.query("update public.profiles set is_active=false where id=$1", [userId]);
+  await actAs(userId);
+  assert.equal((await db.query("update public.restaurants set name='비활성' where id=$1", [id])).affectedRows, 0);
+  await assert.rejects(
+    db.query("insert into public.restaurants(name,category,location) values ('비활성','한식','캠퍼스')"),
+    { code: "42501" },
+  );
+  await db.exec("reset role");
+});
+test("승인된 제보의 맛집은 제보한 회원이 등록자가 된다", async () => {
+  const id = await createSubmission();
+  const { rows } = await db.query<{ created_by: string }>(
+    "select created_by from public.approve_foodmap_submission($1,$2)",
+    [id, adminId],
+  );
+  assert.equal(rows[0].created_by, userId);
+});
+test("SQL Editor용 rls-verify.sql은 모든 항목을 통과하고 검사 데이터를 남기지 않는다", async () => {
+  const verify = readFileSync(
+    path.join(__dirname, "../supabase/rls-verify.sql"),
+    "utf8",
+  );
+  const before = (await db.query("select count(*)::int as n from public.restaurants")).rows;
+  const results = await db.exec(verify);
+  const rows = results.at(-1)!.rows as { pass: boolean; action: string }[];
+  assert.equal(rows.length, 9);
+  for (const row of rows) assert.equal(row.pass, true, row.action);
+  assert.deepEqual(
+    (await db.query("select count(*)::int as n from public.restaurants")).rows,
+    before,
+  );
+  assert.equal(
+    (await db.query("select * from auth.users where email like 'rls-%'")).rows.length,
+    0,
+  );
+});
