@@ -20,7 +20,8 @@
     "test:live": "tsx scripts/verify-live.ts",
     "auth:check": "tsx scripts/check-auth.ts",
     "auth:setup-naver": "tsx scripts/setup-naver-oidc.ts",
-    "rls:check": "tsx scripts/verify-rls.ts"
+    "rls:check": "tsx scripts/verify-rls.ts",
+    "demo:accounts": "tsx scripts/create-demo-accounts.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
