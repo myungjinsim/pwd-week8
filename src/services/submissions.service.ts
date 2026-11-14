@@ -1,7 +1,7 @@
 import { getSupabase, throwDatabaseError } from "../config/supabase";
 import type { AppUser } from "../types/auth.types";
 import type { SubmissionRow } from "../types/database.types";
-import Restaurant from "../models/restaurant.model";
+import { withCreatorNames } from "./restaurants.service";
 import HttpError from "../utils/httpError";
 import { menuField, numericId, objectBody, textField } from "../utils/input";
 
@@ -111,7 +111,7 @@ export async function approveSubmission(id: string, reviewer: AppUser) {
     { p_submission_id: numericId(id), p_reviewer_id: reviewer.id },
   );
   if (error) throwDatabaseError(error);
-  return Restaurant.fromDatabase(data![0]);
+  return (await withCreatorNames([data![0]]))[0];
 }
 export async function deleteSubmission(id: string) {
   const { data, error } = await getSupabase()

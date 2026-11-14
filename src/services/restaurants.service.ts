@@ -44,7 +44,7 @@ function restaurantInput(
   return row;
 }
 // 화면에 등록자 이름을 보여주기 위해 profiles에서 이름만 읽습니다(서버 전용 테이블).
-async function withCreatorNames(rows: RestaurantRow[]) {
+export async function withCreatorNames(rows: RestaurantRow[]) {
   const ids = [...new Set(rows.map((row) => row.created_by).filter(Boolean))] as string[];
   const names = new Map<string, string>();
   if (ids.length) {
