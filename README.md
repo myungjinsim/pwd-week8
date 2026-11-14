@@ -3,8 +3,8 @@
 TypeScript·Express 서버입니다. Supabase Auth로 이메일·Google·네이버 로그인을 처리하고, 맛집 쓰기 권한은 Supabase **행 수준 보안(RLS)** 정책이 판단합니다.
 
 - 클라이언트 저장소: https://github.com/myungjinsim/pwd-week8-client
-- 서비스 주소(Vercel): _배포 후 기입_
-- API 주소(Render): _배포 후 기입_
+- 서비스 주소(Vercel): https://pwd-week8-client-ten.vercel.app
+- API 주소(Render): https://pwd-week8-myungjinsim.onrender.com
 
 ## 권한 표
 
