@@ -61,6 +61,7 @@ npm run dev            # http://localhost:3000
 2. Authentication → URL Configuration
    - Site URL: 배포한 Vercel 주소
    - Redirect URLs: `https://<vercel-주소>/auth/callback`, `http://127.0.0.1:5173/auth/callback`
+   - Authentication → Sign In / Providers → Email의 **Confirm email은 끔**. 별도 SMTP 없이는 Supabase 기본 메일이 조직 멤버 주소로만 발송되므로, 누구나 가입 즉시 로그인해 테스트할 수 있게 했습니다.
 3. Google: Google Cloud에서 웹 OAuth 클라이언트를 만듭니다. redirect URI는 `https://<project-ref>.supabase.co/auth/v1/callback`입니다. 만든 클라이언트를 Supabase → Providers → Google에 등록합니다.
 4. 네이버: NAVER Developers 앱을 만듭니다. Callback URL은 위와 같은 Supabase 주소입니다. `.env`에 `NAVER_CLIENT_ID`·`NAVER_CLIENT_SECRET`을 넣고 `npm run auth:setup-naver`를 실행합니다.
 5. 첫 관리자는 가입 후 `npm run change-user-type -- <이메일> admin`으로 지정합니다. 이후에는 관리자 페이지에서 역할을 바꿀 수 있습니다.
